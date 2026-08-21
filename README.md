@@ -277,3 +277,7 @@ facade.
 This project is independent and has zero dependency on AgentWorld. It originated
 from patterns battle-tested in [AgentWorld](https://github.com/iwana888/AgentWorld),
 and is the part you can take to production on its own.
+
+## License
+
+[MIT](./LICENSE) — free to use, modify, and redistribute.

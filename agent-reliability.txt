@@ -1,0 +1,460 @@
+# Agent‑Reliability 独立仓库拆分落地方案
+
+> 
+> 核心原则：**只做剥离迁移、不重构业务逻辑、保持行为 100% 不变、零反向依赖、API 尽可能兼容**
+
+## 整体实施总览
+
+总共分 8 个阶段，可以按顺序分步执行，每一步都可暂停、可回滚。
+整体变更边界
+
+1. 新建独立仓库 `agent‑reliability`
+2. 将 Reliability Runtime MVP3 全部逻辑迁移过去
+3. 清理全部对 AgentWorld、World、Agent 模型、Scheduler、Memory 的硬依赖
+4. 定义一套框架无关的最小通用抽象（`ToolCall`/`Action`/`Decision`/`Audit`）
+5. 原 AgentWorld 删除 reliability 源码，通过 `go mod` 引入独立包
+6. 两边仓库各自完整跑通单元测试 + 集成回归
+7. 补齐独立 Demo、文档、CI、版本标签
+
+## 阶段 1：前置盘点（迁移前必做，0 代码改动）
+
+### 1.1 梳理现有代码范围
+
+先定位当前 AgentWorld 内可靠性全部源码路径（以现有仓库为准）
+
+```
+agentworld/internal/reliability
+agentworld/internal/reliability/guard
+agentworld/internal/reliability/policy
+agentworld/internal/reliability/audit
+agentworld/internal/reliability/approval
+agentworld/cmd/agentworld‑guard
+```
+
+### 1.2 导出完整依赖树
+
+执行命令扫描全部导入项
+
+```
+# 扫描reliability包所有外部依赖
+go list -deps ./internal/reliability/...
+```
+
+标记三类依赖清单
+
+表格
+
+| 依赖类型 | 处理方案 |
+| --- | --- |
+| AgentWorld 内部包 `internal/*`、`world/*`、`models`、`scheduler`、`memory` | **必须全部移除**，改用通用接口 / 结构体替换 |
+| 标准库 / 通用第三方库 (zap、uuid 等) | 允许保留到 agent‑reliability |
+| World 业务硬编码规则 (Pascal 写保护、hotel 密钥) | **规则样例迁移到 examples**，核心 runtime 不能耦合业务 |
+
+> 
+> 关键点：**业务策略≠运行时内核**。运行时只提供规则引擎，具体行业规则放到示例目录，内核代码不能依赖任何 World。
+
+### 1.3 当前 API 盘点
+
+梳理现有入口 `agentruntime` 的公开方法，作为兼容基准
+
+```
+// 当前AgentWorld侧调用入口
+type Runtime struct{...}
+func New(cfg Config) *Runtime
+func (rt *Runtime) Check(ctx context.Context, action Action) (Decision, error)
+```
+
+记录全部入参、返回结构体、枚举常量 (ALLOW/DENY/ASK/MODIFY)
+
+## 阶段 2：初始化独立仓库 agent‑reliability
+
+### 2.1 创建 Git 仓库
+
+仓库地址示例 `github.com/yourorg/agent‑reliability`
+初始化基础文件
+
+```
+agent-reliability
+├── go.mod
+├── LICENSE          # MIT，和原项目保持一致
+├── README.md
+├── .gitignore
+├── .github/workflows/ci.yml
+├── docs/
+├── examples/
+├── agentruntime/
+├── policy/
+├── guard/
+├── audit/
+├── approval/
+├── adapter/
+└── internal/        # 仅存放reliability自身私有实现，绝对不能引入agentworld概念
+```
+
+`go.mod`（直接复制可用）
+
+```
+module github.com/yourorg/agent-reliability
+
+go 1.22
+
+require (
+	// 只保留必要第三方依赖
+)
+```
+
+> 
+> ⚠️ 这里**绝对不能**添加 agentworld 相关 module 依赖
+
+## 阶段 3：依赖解耦（本次工作难度最高环节）
+
+### 3.2 定义框架无关最小基础模型
+
+在`agentruntime/types.go`，新建通用结构体，**完全不引用 AgentWorld 任何 Model**
+
+```
+package agentruntime
+
+import "context"
+
+// ToolCall 通用工具调用结构体，取代原来绑定AgentWorld的Action
+type ToolCall struct {
+	Name      string
+	Arguments map[string]any
+	Meta      map[string]string // 附加元数据，调用方可以放入agentId等可选信息
+}
+
+// DecisionType 四种决策枚举，必须和原有常量完全一致保证行为不变
+type DecisionType string
+
+const (
+	ALLOW  DecisionType = "ALLOW"
+	DENY   DecisionType = "DENY"
+	ASK    DecisionType = "ASK"
+	MODIFY DecisionType = "MODIFY"
+)
+
+// Decision 返回结果
+type Decision struct {
+	Type          DecisionType
+	Reason        string
+	ModifiedCall  *ToolCall // MODIFY时返回修改后的工具调用
+	PolicyID      string
+	ApprovalToken string // ASK场景下的审批令牌
+}
+
+// AuditRecord 审计日志通用结构
+type AuditRecord struct {
+	ToolCall   ToolCall
+	Decision   Decision
+	Timestamp  int64
+	AgentMeta  map[string]string
+}
+```
+
+> 
+> 所有原来直接 import `agentworld/models`、`agentworld/world` 的地方全部替换成上面通用类型。
+
+### 3.3 依赖分类改造细则
+
+1. **硬引用 Agent 结构体**
+内核不再感知什么是 Agent。Agent 相关信息放到 `ToolCall.Meta` 透传进去，运行时只读、不依赖 Agent 实体。
+2. **World 专属判断逻辑**
+Pascal、Hotel、Economy 的专属规则**移出内核**，放到 `examples/policy_samples` 作为示例策略，内核只提供通用规则执行引擎。
+> 
+> 内核只负责执行规则，不内置任何业务规则。
+3. **数据库依赖**
+Audit 模块：内核只产出 AuditRecord，**不绑定任何数据库**。存储实现交给上层调用方 (AgentWorld)；内核只提供回调接口
+```
+// AuditHandler 审计回调接口，上层实现存储
+type AuditHandler func(record AuditRecord) error
+```
+4. **MCP/HTTP 适配器**
+adapter 目录只做 ToolCall 的格式转换，不耦合 AgentWorld MCP 实现。
+
+## 阶段 4：代码迁移
+
+### 4.1 复制源码
+
+将原 `agentworld/internal/reliability` 的源码复制到新项目对应包路径
+
+```
+agentworld/internal/reliability/guard    → agent‑reliability/guard
+agentworld/internal/reliability/policy   → agent‑reliability/policy
+agentworld/internal/reliability/audit    → agent‑reliability/audit
+agentworld/internal/reliability/approval → agent‑reliability/approval
+```
+
+原 `agentruntime` 入口迁移至 `agent‑reliability/agentruntime`
+
+### 4.2 全局清理 import
+
+批量删除所有如下形式导入
+
+```
+"yourorg/agentworld/internal/..."
+"yourorg/agentworld/models"
+"yourorg/agentworld/world"
+```
+
+凡是需要 AgentWorld 数据，改用 `ToolCall.Meta` 透传。
+
+### 4.3 Runtime 入口改造
+
+`agentruntime/runtime.go`
+
+```
+type Runtime struct {
+	policyEngine *policy.Engine
+	auditHandler AuditHandler
+	// ...其他原有字段
+}
+
+// New 创建独立Runtime实例
+func New(cfg Config, auditHandler AuditHandler) *Runtime {
+    // ...原有初始化逻辑不变
+}
+
+// Check 核心校验入口，入参改为通用ToolCall
+func (rt *Runtime) Check(ctx context.Context, call ToolCall) (Decision, error) {
+    // 原有完整的guard、policy判断逻辑原样保留，不改动
+}
+```
+
+### 4.4 兼容层（最小改动 AgentWorld）
+
+为了最大程度减少 AgentWorld 改造量，**在 AgentWorld 侧做一层薄薄的适配转换层**，而不是修改 agent‑reliability 内核。
+
+> 
+> AgentWorld 侧适配层示例 `agentworld/internal/adapter/reliability_adapter.go`
+
+```
+package adapter
+
+import (
+	"yourorg/agent‑reliability/agentruntime"
+	"yourorg/agentworld/models"
+)
+
+// AgentWorld Action → 独立项目通用ToolCall
+func ActionToToolCall(action models.ToolAction) agentruntime.ToolCall {
+	return agentruntime.ToolCall{
+		Name:action.Name,
+		Arguments:action.Args,
+		Meta:map[string]string{
+			"agent_id": action.AgentID,
+			"world":action.WorldName,
+		},
+	}
+}
+
+// ToolCall转回AgentWorld内部Action
+func ToolCallToAction(call agentruntime.ToolCall) models.ToolAction{
+    //类型转换
+}
+```
+
+**好处：**
+
+- agent‑reliability 完全干净
+- AgentWorld 原有业务代码几乎不用大面积改动
+- 转换逻辑全部收拢在一个 adapter 文件，方便后续迭代
+
+## 阶段 5：独立项目自测 & 最小 Demo
+
+### 5.1 单元测试补齐
+
+所有原有单元测试迁移过来，删掉依赖 AgentWorld 实体的用例，改用纯内存构造`ToolCall`
+执行
+
+```
+go test -v ./...
+```
+
+必须全部 PASS。
+
+### 5.2 独立 Demo 示例 examples/demo/main.go
+
+**完全不需要 AgentWorld**即可运行，用于验证项目独立性
+
+```
+package main
+
+import (
+	"context"
+	"fmt"
+	"github.com/yourorg/agent-reliability/agentruntime"
+	"github.com/yourorg/agent-reliability/policy"
+)
+
+func main(){
+	//初始化审计回调，简单打印
+	auditCallback := func(record agentruntime.AuditRecord) error{
+		fmt.Printf("AUDIT: %+v\n",record)
+		return nil
+	}
+	rt := agentruntime.New(agentruntime.Config{},auditCallback)
+
+	//注册一条示例策略：禁止rm -rf /
+	rt.AddRule(policy.Rule{
+		ID:"block-rm-root",
+		Match:policy.ToolNameMatch("shell"),
+		Action:policy.DenyAction("禁止删除根目录"),
+	})
+
+	//构造工具调用
+	call := agentruntime.ToolCall{
+		Name:"shell",
+		Arguments:map[string]any{
+			"command":"rm -rf /",
+		},
+	}
+
+	dec,err := rt.Check(context.Background(),call)
+	if err != nil{
+		panic(err)
+	}
+	fmt.Printf("Decision: %s, Reason: %s\n",dec.Type,dec.Reason)
+}
+```
+
+运行验证
+
+```
+go run ./examples/demo
+```
+
+预期输出 `DENY`。
+
+### 5.3 内置第一批样例策略
+
+放到 `examples/policy_samples`
+
+- 文件保护规则：禁止修改 tests 目录
+- Git 规则：禁止 force push main
+- 数据库：生产库变更需要人工 ASK 审批
+- MODIFY 样例：自动重定向 test_x.pas → src/x.pas
+
+> 
+> 样例只是 demo，**不会编译进内核包**
+
+## 阶段 6：改造 AgentWorld 主仓库
+
+### 6.1 添加 module 依赖
+
+agentworld/go.mod 新增依赖
+
+```
+require github.com/yourorg/agent-reliability v0.1.0
+```
+
+执行
+
+```
+go mod tidy
+```
+
+### 6.2 删除原有 reliability 源码
+
+删除整个目录
+`agentworld/internal/reliability`
+
+### 6.3 使用适配层接入
+
+AgentWorld 所有原来直接调用 reliability 的位置，先走 adapter 做结构体转换，再调用独立库 Runtime.Check ()。
+
+> 
+> AgentWorld 保留自己的 Audit 存储实现：实现 agent‑reliability 的 AuditHandler 回调接口，写入原有数据库。
+
+## 阶段 7：全量回归测试
+
+### 7.1 agent‑reliability
+
+```
+go test ./...
+```
+
+### 7.2 AgentWorld 完整回归
+
+```
+go test ./...
+# 运行原有可靠性cross‑world、reliability‑demo
+go run ./worlds/pascal/cmd/pascal --reliability-crossworld
+go run ./worlds/pascal/cmd/pascal --reliability-inject
+go run ./worlds/pascal/cmd/pascal --reliability-demo
+```
+
+校验原有全部用例行为完全不变：
+
+1. Pascal 禁止修改 tests 文件 (MODIFY / DENY)
+2. Shell rm‑rf / → DENY
+3. Git force push → DENY
+4. Hotel master‑key → ASK
+
+> 
+> 拆分之后**业务决策结果必须完全和拆分前一模一样**，否则视为迁移失败。
+
+## 阶段 8：CI、文档、版本发布
+
+### 8.1 CI 配置 (.github/workflows/ci.yml)
+
+- go build ./...
+- go test -race ./... 开启并发检测
+- golint 代码检查
+
+### 8.2 README 撰写（严格按照需求文档）
+
+开头第一句
+
+> 
+> Agent Reliability Runtime 是一个位于 AI Agent 与实际 Tool 执行之间的安全控制层。
+
+包含：
+
+- 四层决策 ALLOW/DENY/ASK/MODIFY 原理图
+- 5 分钟快速上手代码
+- 策略配置示例
+- 集成指南（如何接入 LangGraph/Dify/ 自研 Agent）
+- Roadmap
+
+### 8.3 打版本 Tag
+
+第一个正式版本 `v0.1.0`
+
+## 风险点 & 规避方案
+
+表格
+
+| 风险 | 解决办法 |
+| --- | --- |
+| 结构体改动导致 AgentWorld 大量代码需要重写 | 新增薄薄一层 adapter 转换层，隔离两边类型定义，最小改动 |
+| 依赖清理不干净，隐性导入 agentworld 包 | CI 增加依赖检查脚本，禁止 import agentworld 路径 |
+| 拆分前后行为不一致 | 完整跑一遍全部原有 reliability demo 用例，决策结果快照对比 |
+| 循环依赖 agent‑reliability <-> agentworld | 内核侧绝对不 import agentworld，所有上层信息依靠 ToolCall.Meta 透传 |
+
+## 完整交付验收清单（和需求文档一一对应）
+
+### P0
+
+- agent‑reliability 独立 Git 仓库、独立 go.mod
+- 内核**零 AgentWorld 依赖**，不存在反向导入
+- AgentWorld 删除原有 reliability 源码，go module 方式引入
+- agent‑reliability 单元测试全部通过
+- AgentWorld 原有全部测试、可靠性 Demo 正常运行，行为不变
+
+### P1
+
+- ALLOW / DENY / ASK / MODIFY 4 种决策完整可用
+- Policy、Guard 引擎完整迁移
+- Audit 回调接口、审批机制迁移完成
+- 并发安全
+
+### P2
+
+- 无 AgentWorld 依赖的独立最小 Demo 可运行
+- 基础样例安全策略
+- README 快速开始文档
+- GitHub CI 流水线
+- v0.1.0 版本标签
+
+如果你需要，我可以输出一份：**可以直接粘贴执行的迁移任务清单 Markdown 文档**，或者生成 agent‑reliability 项目完整脚手架代码包。

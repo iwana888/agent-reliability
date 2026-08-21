@@ -1,0 +1,13 @@
+# Binaries
+*.exe
+*.out
+*.test
+
+# Build output
+/cmd/*/guard
+/cmd/*/*.exe
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

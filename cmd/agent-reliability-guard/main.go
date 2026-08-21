@@ -1,7 +1,7 @@
-// Command agentworld-guard is a tiny standalone CLI for the Agent Reliability Runtime.
+// Command agent-reliability-guard is a tiny standalone CLI for the Agent Reliability Runtime.
 //
 // It reads one Action as JSON from stdin and prints the Decision as JSON to stdout.
-// No AgentWorld dependency, no network — drop it in front of any agent's tool calls.
+// No external dependency, no network — drop it in front of any agent's tool calls.
 //
 // Input:
 //
@@ -96,6 +96,6 @@ func marshal(v any, pretty bool) ([]byte, error) {
 }
 
 func fail(msg string) {
-	os.Stderr.WriteString("agentworld-guard: " + msg + "\n")
+	os.Stderr.WriteString("agent-reliability-guard: " + msg + "\n")
 	os.Exit(2)
 }

@@ -1,6 +1,6 @@
 // Package agentreliability is a standalone safety boundary for autonomous agents.
 //
-// It does NOT depend on AgentWorld. Any agent framework (Claude Code, Codex,
+// It does NOT depend on any specific agent framework. Any agent framework (Claude Code, Codex,
 // OpenAI Agents, LangChain, AutoGen, or your own) can mount it in front of every
 // tool call:
 //

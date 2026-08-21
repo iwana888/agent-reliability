@@ -117,6 +117,6 @@ go run ./cmd/collect-feedback --answers answers.txt
 cd agent-reliability
 go test ./...                 # 回归：10 个场景
 go build ./...                # 编译
-go run ./cmd/agentworld-guard # 看默认策略实际拦截效果
+go run ./cmd/agent-reliability-guard # 看默认策略实际拦截效果
 go run ./cmd/collect-feedback # 跑验证闭环
 ```
